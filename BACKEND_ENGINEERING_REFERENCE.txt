@@ -1,0 +1,699 @@
+# Backend & System Design Reference
+
+> A universal engineering reference for building production-grade backends.
+> Drop this file into any repo (or reference it from `CLAUDE.md`) so Claude Code, and every human on the team, follows the same principles.
+
+---
+
+## 0. How to Use This File with Claude Code
+
+**Option A: reference it from `CLAUDE.md`**
+```md
+# CLAUDE.md
+Follow the engineering standards in ./docs/BACKEND_ENGINEERING_REFERENCE.md.
+Before designing or changing any API, database schema, cache, queue, or deployment,
+check the relevant section and the "Design Review Checklist" at the end.
+```
+
+**Option B: point Claude at a section in your prompt**
+- "Design the orders API following section 2 (REST) and section 9 (idempotency, retries)."
+- "Review this service against the Design Review Checklist and list gaps."
+- "Add caching to `/products` using cache-aside with TTL, per section 5."
+
+**Rules for Claude Code when using this reference**
+1. Choose the **simplest design that meets current scale**; note how it would evolve, but don't over-engineer.
+2. Every external call needs a **timeout**; every retried write needs **idempotency**.
+3. Every new endpoint returns **correct status codes** and **structured errors**.
+4. Every new table gets **indexes for its query patterns** and **unique constraints** for business keys.
+5. Every new service emits **structured logs, metrics, and trace IDs**.
+6. State trade-offs explicitly when picking between options in this file.
+
+---
+
+## 1. Core Backend Foundations
+
+These are the concepts every backend developer should understand and be able to explain clearly.
+
+### 1.1 API Design & REST
+- **API** (Application Programming Interface): a contract that lets different systems communicate.
+- **REST** (Representational State Transfer): the most common architectural style for HTTP APIs.
+- **REST principles:** stateless, resource-based URLs (nouns, not verbs), standard HTTP methods, correct status codes.
+
+```
+GET     /users        → list users
+POST    /users        → create user
+GET     /users/1      → get one user
+PUT     /users/1      → replace user (full update)
+PATCH   /users/1      → partial update
+DELETE  /users/1      → delete user
+```
+
+**Conventions**
+- Plural nouns: `/orders`, `/orders/{id}/items`.
+- Version your API: `/v1/orders` or a header.
+- Paginate all list endpoints (see §4.1).
+- Consistent error body:
+  ```json
+  { "error": { "code": "VALIDATION_FAILED", "message": "email is required", "traceId": "a1b2c3" } }
+  ```
+
+### 1.2 HTTP Methods & Status Codes
+
+| Method | Purpose | Idempotent? | Safe? |
+|---|---|---|---|
+| GET | Retrieve data | Yes | Yes |
+| POST | Create new resource | **No** (make it so with idempotency keys) | No |
+| PUT | Replace existing resource (full) | Yes | No |
+| PATCH | Partial update | Not guaranteed | No |
+| DELETE | Remove resource | Yes | No |
+
+| Code | Meaning | When to use |
+|---|---|---|
+| 200 | OK | Successful read/update |
+| 201 | Created | Resource created (return `Location` header) |
+| 204 | No Content | Success with no body (e.g., delete) |
+| 400 | Bad Request | Invalid input / validation failure |
+| 401 | Unauthorized | Not authenticated (missing/invalid credentials) |
+| 403 | Forbidden | Authenticated but lacks permission |
+| 404 | Not Found | Resource doesn't exist |
+| 409 | Conflict | Duplicate, version conflict (optimistic locking) |
+| 422 | Unprocessable Entity | Semantically invalid input |
+| 429 | Too Many Requests | Rate limit exceeded |
+| 500 | Internal Server Error | Unexpected server bug |
+| 502 / 503 / 504 | Bad Gateway / Unavailable / Gateway Timeout | Upstream failure, overload, timeout |
+
+### 1.3 Stateless vs Stateful
+
+| Stateless | Stateful |
+|---|---|
+| Each request is independent and carries everything needed | Server remembers client state between requests |
+| No server-side session | Uses sessions stored on the server |
+| Scales easily (any instance can serve any request) | Harder to scale (sticky sessions or shared store needed) |
+| Common in REST APIs | Traditional web apps, WebSockets, game servers |
+
+**Default:** keep app servers stateless; push state into a DB, cache (Redis), or the token.
+
+### 1.4 Authentication vs Authorization
+- **Authentication:** *Who are you?* Verifies identity (login with username/password, OAuth, SSO).
+- **Authorization:** *What are you allowed to do?* Checks permissions (e.g., only admins can delete a user).
+- **Always authenticate first, then authorize every action.**
+- Common authorization models: RBAC (roles), ABAC (attributes), resource ownership checks.
+- Enforce authorization on the **server**, never trust the client UI.
+
+### 1.5 JWT vs Session-based Authentication
+
+| JWT (JSON Web Token) | Session-based |
+|---|---|
+| Token-based, stateless | Server stores session data (memory, Redis, DB) |
+| Token contains user info, signed with a secret/private key | Client sends a session ID, usually in a cookie |
+| No server-side storage → more scalable | Stateful |
+| Hard to revoke before expiry | Easy to invalidate server-side (logout) |
+| Common in mobile apps, SPAs, microservices | Common in traditional web apps |
+
+**JWT structure:** `header.payload.signature`
+- **Header:** algorithm (e.g., HS256, RS256)
+- **Payload:** claims (user ID, roles, `exp`)
+- **Signature:** verifies the token wasn't tampered with
+
+**Session flow:** Client → login (username/password) → Server creates session (`sessionId` + user data) in Session Store (DB/Redis) → `Set-Cookie: sessionId` → client sends cookie on every request.
+
+**Best practices**
+- JWTs: short-lived access tokens (5–15 min) + refresh tokens; never put secrets/PII in the payload (it's only base64, not encrypted); validate `exp`, `iss`, `aud`.
+- Cookies: `HttpOnly`, `Secure`, `SameSite`; add CSRF protection for cookie-based auth.
+- Hash passwords with bcrypt/argon2, never plain or fast hashes.
+
+### 1.6 OAuth 2.0 Basics
+- A widely used **authorization** framework (OpenID Connect adds authentication on top).
+- Lets third-party apps access a user's resources **without sharing passwords** (e.g., "Sign in with Google").
+- **Roles:** Resource Owner (user), Client (your app), Authorization Server (Google/GitHub), Resource Server (the API).
+
+**Authorization Code flow (with PKCE for SPAs/mobile)**
+```
+1. User → Client: clicks "Sign in with Google"
+2. Client → Auth Server: redirect user to authorize
+3. User approves → Auth Server returns an authorization code
+4. Client → Auth Server: exchanges code for Access Token (+ Refresh Token)
+5. Client → Resource Server: calls API with Access Token
+```
+- Request only the **scopes** you need.
+- Store tokens securely; never in localStorage for sensitive apps.
+
+---
+
+## 2. Core Backend Foundations – Part 2
+
+### 2.1 Rate Limiting vs Throttling
+Both control how many requests a user/client can make: they prevent abuse, protect resources, and keep the system stable.
+
+| Rate Limiting | Throttling |
+|---|---|
+| Strict limit on number of requests | Slows down the request rate instead of blocking immediately |
+| Excess requests are blocked (HTTP 429) | Requests are allowed but processed slowly / queued |
+| Prevents misuse and spam | Handles traffic spikes, keeps system stable |
+
+**Example:** allow 100 requests per minute per user; beyond that return `429 Too Many Requests` with a `Retry-After` header.
+
+**Algorithms:** Token Bucket (allows bursts), Leaky Bucket (smooth output), Fixed Window (simple), Sliding Window (accurate).
+**Where:** API gateway / load balancer / middleware; use Redis for limits shared across instances.
+**Key by:** user ID, API key, or IP (for unauthenticated routes like login).
+
+### 2.2 Idempotency
+- **Idempotent** = sending the same request multiple times produces the same result as sending it once.
+- Critical for payments, retries, and distributed systems; prevents duplicate records and duplicate charges.
+
+**Idempotency key pattern (e.g., Payment API)**
+```
+1. Client generates a unique Idempotency-Key (UUID) per logical operation.
+2. Client → POST /payments  (Header: Idempotency-Key: 7f3c...)
+3. Server checks if the key was already processed:
+     - Yes → return the stored response (no duplicate payment)
+     - No  → process, store key + response atomically, return response
+4. Client retries with the SAME key on timeout/network error.
+```
+- Store keys with a TTL (e.g., 24h); scope by user.
+- Back it with a unique constraint so concurrent duplicates fail safely.
+
+### 2.3 JWT vs Session Auth → see §1.5
+### 2.4 OAuth 2.0 → see §1.6
+
+---
+
+## 3. Databases & Data Handling
+
+A backend is only as strong as its data layer. Understand how to store, retrieve, and manage data efficiently and reliably.
+
+### 3.1 SQL vs NoSQL
+
+| | SQL | NoSQL |
+|---|---|---|
+| Data model | Relational (tables, rows) | Document, key-value, wide-column, graph |
+| Schema | Fixed schema | Flexible schema |
+| Best for | Transactional, relational data | Large-scale / unstructured / high-write data |
+| Examples | PostgreSQL, MySQL | MongoDB, Cassandra, Redis, DynamoDB |
+| Scaling | Usually vertical (+ read replicas, sharding) | Usually horizontal |
+| Guarantees | ACID | Often eventual consistency (varies) |
+
+**Default:** start with PostgreSQL unless you have a specific reason not to. Choose NoSQL for a known access pattern it fits better (caching, massive write throughput, flexible documents).
+
+### 3.2 Indexing
+- An index is a supporting data structure (usually a **B-Tree**) that speeds up data retrieval.
+- **Without index:** full table scan → slow (scans all rows).
+- **With index:** scans only the required rows → fast.
+- **Too many indexes slow down writes** (INSERT, UPDATE, DELETE) and use storage.
+
+**Guidelines**
+- Index columns used in `WHERE`, `JOIN`, `ORDER BY`, and foreign keys.
+- Composite indexes: order matters (leftmost-prefix rule); put equality columns before range columns.
+- Verify with `EXPLAIN` / `EXPLAIN ANALYZE`.
+- Avoid wrapping indexed columns in functions in `WHERE` (breaks index use) unless using a functional index.
+
+### 3.3 ACID Properties
+Ensures data consistency in transactional systems (financial, payments, booking).
+
+| | Property | Meaning |
+|---|---|---|
+| A | Atomicity | All or nothing |
+| C | Consistency | Data moves from one valid state to another |
+| I | Isolation | Concurrent transactions don't interfere with each other |
+| D | Durability | Committed data survives failures |
+
+### 3.4 Transaction Isolation Levels
+Define how isolated one transaction is from others. They prevent dirty reads, non-repeatable reads, and phantom reads.
+
+| Isolation Level | Prevents | Trade-off |
+|---|---|---|
+| Read Uncommitted | Nothing | Fastest, least safe |
+| Read Committed | Dirty reads | Default in PostgreSQL |
+| Repeatable Read | Dirty + non-repeatable reads | Default in MySQL InnoDB |
+| Serializable | Dirty + non-repeatable + phantom reads | Safest, slowest, more retries |
+
+- **Dirty read:** reading uncommitted data from another transaction.
+- **Non-repeatable read:** same row read twice gives different values.
+- **Phantom read:** same query returns new/missing rows on re-run.
+
+### 3.5 Normalization vs Denormalization
+
+| Normalization | Denormalization |
+|---|---|
+| Breaks data into smaller related tables to reduce redundancy | Combines data into fewer tables |
+| Improves consistency | Reduces joins, improves read performance |
+| Normal forms: 1NF, 2NF, 3NF, BCNF | Can lead to redundancy and update anomalies |
+| Best for transactional (OLTP) systems | Best for analytics, dashboards, high-read systems |
+
+**Default:** normalize first (3NF), denormalize deliberately where reads are proven hot.
+
+---
+
+## 4. Database Scaling
+
+As the application grows, the database must handle more data and more traffic efficiently.
+
+### 4.1 Pagination: Offset vs Cursor
+
+| Offset-based | Cursor-based (keyset) |
+|---|---|
+| Uses `LIMIT` and `OFFSET` | Uses a cursor (last seen ID or timestamp) |
+| Simple to implement | Better performance for large datasets |
+| Slow for large offsets (DB still scans skipped rows) | Consistent: avoids missing/duplicate records |
+| Can miss or duplicate records if data changes | Common in production systems / infinite scroll |
+| `SELECT * FROM users LIMIT 10 OFFSET 20;` | `SELECT * FROM users WHERE id > 20 ORDER BY id LIMIT 10;` |
+
+Use offset for small admin tables needing page numbers; use cursor for feeds, APIs, and large tables. Always `ORDER BY` a unique, indexed column.
+
+### 4.2 Sharding vs Partitioning
+Both handle large data by splitting it.
+
+| Sharding (across databases) | Partitioning (within same DB) |
+|---|---|
+| Splits data across multiple database servers | Splits a table into parts inside one database |
+| Horizontal scaling | Logical division |
+| e.g., Shard 1 (users A–M), Shard 2 (N–Z) | e.g., partitions by year: 2022, 2023, 2024 |
+| Used in very large systems; complex (cross-shard joins, rebalancing) | Based on range (date), list, or hash; helps manage large tables |
+
+**Shard key choice is critical:** high cardinality, even distribution, matches query pattern. Shard only after replicas, caching, and partitioning are exhausted.
+
+### 4.3 Read Replicas
+- Copies of the primary database used for **read** operations.
+- Writes (INSERT/UPDATE/DELETE) → Primary (Master); replication → Read Replica 1, 2…; reads (SELECT) → replicas.
+- Distributes read traffic, reduces load on primary.
+- **Watch for replication lag:** read-your-own-writes may need to hit the primary.
+
+### 4.4 Write Scaling
+Writes are harder to scale than reads. Approaches:
+- Sharding / partitioning (distribute writes across DBs)
+- Queue writes for async processing (Kafka, RabbitMQ)
+- Batch writes instead of single inserts
+- Write-behind cache
+- Distributed databases (Cassandra, DynamoDB)
+- Design for eventual consistency where acceptable
+
+### 4.5 Handling Duplicate Records
+Duplicates arise from retries, concurrent requests, or race conditions. Ways to handle:
+- **Unique constraints** (on email, orderId):
+  ```sql
+  ALTER TABLE users ADD CONSTRAINT unique_email UNIQUE (email);
+  ```
+- **Check before inserting** (not enough alone: race-prone; combine with a constraint).
+- **Upserts:** `INSERT ... ON CONFLICT DO NOTHING / DO UPDATE`.
+- **Idempotency keys** for critical operations (payments): client sends a unique `requestId`; server checks if it exists; if yes, return the existing result instead of creating a new record.
+
+### 4.6 Optimistic vs Pessimistic Locking
+Handle concurrent updates to the same data and prevent inconsistency.
+
+| Optimistic Locking | Pessimistic Locking |
+|---|---|
+| Assumes conflicts are rare | Assumes conflicts are common |
+| Uses a version number or timestamp | Locks the data while updating |
+| On conflict, update fails → retry or return 409 | Other transactions must wait |
+| Better throughput, no lock waiting | Safer under heavy contention; risk of deadlocks |
+| `UPDATE ... SET v = v+1 WHERE id=? AND v=?` | `SELECT ... FOR UPDATE` |
+
+---
+
+## 5. Caching & Performance Optimization
+
+Caching reduces latency, improves performance, and lowers database load by storing frequently accessed data closer to the user.
+
+### 5.1 What to Cache?
+- Frequently accessed and rarely changing data
+- Expensive-to-compute / aggregated results
+- Data that is the same for many users
+- API responses, session data, static content (images, JS, CSS)
+
+**Examples:** product details, user profiles, category lists, reference data (countries, states), dashboard data, configurations.
+
+**Don't cache:** highly dynamic data where staleness is unacceptable (live stock prices, account balances) unless with very short TTL and clear rules.
+
+### 5.2 Where to Cache?
+
+| Layer | Description | Examples |
+|---|---|---|
+| Application cache (in-memory) | Stored in app memory or a shared cache; very fast | HashMap, Caffeine, Redis/Memcached as app cache |
+| Database cache | Query result / buffer cache; reduces disk I/O; managed by the DB | PostgreSQL/MySQL buffer pool |
+| CDN / Edge cache | Static content and GET responses cached near users geographically | Cloudflare, AWS CloudFront, Akamai |
+| Client / browser cache | `Cache-Control`, `ETag` headers | Browser, mobile app |
+
+Choose the layer based on data size, access frequency, and latency requirements.
+
+### 5.3 Basic Read Flow (Cache-Aside)
+```
+Client Request → Check Cache
+   ├─ Data present (hit)  → Return from cache
+   └─ Not present (miss)  → Fetch from DB → Store in cache with TTL → Return
+```
+
+### 5.4 Cache Eviction Strategies
+
+| Strategy | Description |
+|---|---|
+| TTL (Time To Live) | Data expires after a fixed time |
+| LRU (Least Recently Used) | Removes least recently accessed data when cache is full |
+| LFU (Least Frequently Used) | Removes least frequently used data |
+| FIFO (First In First Out) | Removes the oldest data first |
+
+**TTL example:** `SET user:1 "John" EX 3600` → expires after 1 hour. Product details TTL: 5 min; user profile TTL: 1 hour.
+**LRU example:** cache `[A B C D]` full; adding E evicts A (least recently used) → `[B C D E]`.
+
+### 5.5 Cache Consistency & Write Strategies
+Challenge: keeping cached data in sync with the source.
+
+| Strategy | How it works | Trade-off |
+|---|---|---|
+| **Cache-aside** (most common) | App reads cache; on miss reads DB and fills cache; on write updates DB then invalidates cache | Simple; brief staleness possible |
+| **Write-through** | Write to cache and DB together | Consistent; slower writes |
+| **Write-behind** | Write to cache; DB updated async | Fast writes; risk of data loss |
+| **Event-driven invalidation** | DB change publishes event (e.g., Kafka/CDC) → caches invalidated | Scales across services; more infra |
+| **Short TTL** | Frequently changing data expires quickly | Simple safety net |
+
+**Invalidation on update:** 1) update data in DB → 2) invalidate/delete cache key → 3) next read fetches fresh data.
+Prefer **delete** over **update** of cache keys to avoid race conditions.
+
+### 5.6 The Stale Data Problem
+- Stale data = cache still serving old data after the source changed. Leads to incorrect information shown to users.
+- **Example:** user updates their profile, but cache still holds the old version; others see outdated profile until TTL expires.
+- **How to handle:** proper invalidation, short TTL for critical data, event-driven updates, avoid caching highly dynamic data.
+
+### 5.7 CDN / Edge Caching
+- Stores static content on geographically distributed edge servers; serves from the nearest location → lower latency, less origin load.
+- Flow: `User (India) → Nearest Edge Server (India) → [miss] → CDN network → Origin server`.
+- Used for images, videos, CSS, JS, and sometimes cacheable GET API responses.
+- Use content hashing in filenames (`app.3f9a1.js`) for safe long TTLs.
+
+### 5.8 When Caching Causes Issues
+- Serving stale or outdated data (e.g., caching live stock prices in a trading system).
+- Increased complexity (invalidation is hard).
+- **Cache stampede / thundering herd:** many requests miss simultaneously and hammer the DB → use locks/request coalescing, jittered TTLs, early refresh.
+- **Cache penetration:** repeated requests for non-existent keys → cache null results briefly or use a Bloom filter.
+- Memory pressure and inconsistent data across multiple cache layers.
+- **Never let the cache become the only source of truth** (unless designed for it); the system must survive a cache outage.
+
+---
+
+## 6. Distributed Systems & Scaling
+
+Used to handle high traffic, improve availability, and scale efficiently by distributing load and services.
+
+### 6.1 Load Balancing
+- Distributes incoming traffic across multiple servers: `Client → Load Balancer → Server 1 / 2 / 3`.
+- Better resource utilization, high availability, no single point of failure.
+- Implemented with Nginx, HAProxy, AWS ALB/NLB, Envoy.
+- Health checks remove unhealthy instances automatically.
+- L4 (TCP) vs L7 (HTTP, path/header-based routing).
+
+### 6.2 Load Balancing Strategies
+
+| Strategy | How it works | Best for |
+|---|---|---|
+| Round Robin | Requests distributed in fixed order (1→2→3) | Simple, uniform requests (most common) |
+| Weighted Round Robin | Bigger servers get more traffic | Mixed server sizes |
+| Least Connections | Send to server with fewest active connections | Varying request processing time |
+| Hashing (IP / Consistent Hashing) | `hash(clientIP) % N` routes same client to same server | Session persistence, caching |
+
+**Consistent hashing** minimizes key remapping when servers are added/removed (vs plain `% N`).
+
+### 6.3 Horizontal vs Vertical Scaling
+
+| Vertical Scaling (Scale Up) | Horizontal Scaling (Scale Out) |
+|---|---|
+| Increase resources (CPU, RAM, disk) of one server | Add more servers |
+| Simple to implement | Better fault tolerance and high availability |
+| Hardware limit; can't scale indefinitely | Can scale almost indefinitely |
+| Single point of failure | More complex (load balancing, service discovery, stateless apps) |
+
+**Practical path:** scale up first (cheap, simple), then scale out stateless app servers behind a load balancer.
+
+### 6.4 Monolith vs Microservices
+
+| Monolith | Microservices |
+|---|---|
+| Entire application in a single codebase (UI + business logic + data access) | Application split into smaller, independent services (User, Order, Payment, Product, Notification…) |
+| Easier to develop and deploy initially | Each service developed, deployed, and scaled separately |
+| Good for small–medium apps and small teams | Better fault isolation |
+| Harder to scale specific parts independently | More complex: service discovery, inter-service communication, monitoring, distributed data |
+| Any change requires redeploying the whole app | Common in large distributed systems with many teams |
+
+**Default:** start with a **modular monolith** (clear module boundaries). Extract services only when team size, scaling needs, or deployment independence justify it.
+
+### 6.5 Service Communication: REST vs gRPC vs Messaging
+
+| REST (HTTP/JSON) | gRPC (HTTP/2 + Protocol Buffers) | Messaging (Kafka, RabbitMQ, SQS) |
+|---|---|---|
+| Uses HTTP and JSON | Binary format with Protobuf contracts | Asynchronous via a message broker |
+| Simple, widely adopted, human-readable | Faster, more efficient, strongly typed | Decouples services in time and availability |
+| Stateless | Supports bidirectional streaming | Better for event-driven architecture |
+| Best for public APIs, browser clients | Best for internal service-to-service calls | Best for background jobs, events, fan-out |
+| Synchronous: caller waits | Synchronous (or streaming) | Caller doesn't wait; must handle eventual consistency, retries, duplicates |
+
+---
+
+## 7. Reliability & Failure Handling
+
+In distributed systems, failures are normal. Good systems handle them gracefully and still work reliably.
+
+### 7.1 Delivery Guarantees: At-least-once vs Exactly-once
+
+| At-least-once | Exactly-once |
+|---|---|
+| Message delivered at least once | Message delivered/processed only once |
+| Can be delivered multiple times (duplicates) | No duplicates |
+| Consumer must handle duplicates (idempotency) | Harder to achieve |
+| Common in Kafka, RabbitMQ, SQS | Implemented via deduplication, transactions, or idempotency keys |
+| | Common in financial systems (payments) |
+
+**Practical rule:** assume at-least-once delivery and make consumers **idempotent** ("effectively exactly-once"). At-most-once = may lose messages; avoid for important data.
+
+### 7.2 Retries
+- Used when a request fails due to network issues, server errors, or timeouts.
+- Improve reliability, but must be done with:
+  - **Exponential backoff:** wait 1s, 2s, 4s, 8s…
+  - **Jitter:** randomize delays to avoid synchronized retry storms
+  - **Max retry limit**
+  - **Idempotency:** to avoid duplicate actions
+- Retry only **transient** errors (timeouts, 503, 429 respecting `Retry-After`); never retry 400/401/403/404.
+
+```
+Request (API call) → Success? ─Yes→ Continue
+                         └No→ Wait (1s, 2s, 4s, 8s...) → Retry (until max)
+```
+
+### 7.3 Timeouts
+- Maximum time to wait for a response; if not received, the request fails.
+- Prevents threads/connections hanging forever and cascading failures.
+- Essential for every external call (HTTP, DB, cache, queue).
+- Example: `Client → External Service (timeout 2s)`; no response within 2s → timeout error.
+- Set connect + read timeouts; downstream timeouts must be shorter than upstream ones.
+
+### 7.4 Circuit Breakers
+Prevent the system from repeatedly calling a failing service.
+
+```
+CLOSED (normal) ──failures reach threshold──► OPEN (block requests, fail fast)
+   ▲                                              │ after cool-down
+   │ success                                      ▼
+   └────────────── HALF-OPEN (allow a few test requests)
+                        └── failure → back to OPEN
+```
+- Fail fast, give the failing service time to recover, enable graceful degradation.
+- Libraries: Resilience4j, Polly, opossum, service mesh (Istio/Envoy).
+
+### 7.5 Race Conditions
+- Occur when multiple threads/services access and modify the same data simultaneously → inconsistent or incorrect results.
+- Common in high-concurrency systems.
+- **Seat booking example:** without a lock, User A and User B both book seat 1 → both succeed (duplicate booking). With a lock/transaction → only one succeeds, the other fails.
+- **Fixes:** DB transactions, unique constraints, atomic operations (`UPDATE ... WHERE available = true`), optimistic/pessimistic locking, distributed locks.
+
+### 7.6 Distributed Locks
+- Ensure only one instance can perform a critical operation at a time across multiple servers.
+- Tools: Redis (`SET key value NX PX 30000`, Redlock), ZooKeeper, etcd, database locks (advisory locks).
+- Example: App 1 acquires lock on Redis and processes; App 2 cannot acquire lock and must wait or skip.
+- **Always** set a lock expiry (TTL), release only your own lock (compare token), and use fencing tokens for strict correctness.
+
+### 7.7 Event-driven Architecture
+- Components communicate by publishing/consuming events instead of direct calls.
+- Builds scalable, loosely coupled systems; common in microservices.
+- Example: `Order Service → publish "OrderPlaced" → Event bus (Kafka) → Inventory, Payment, Notification services consume it`.
+- **Considerations:** event schemas/versioning, ordering, idempotent consumers, dead-letter queues, eventual consistency.
+- **Transactional Outbox pattern:** write the event to an `outbox` table in the same DB transaction as the data change, then publish reliably, avoiding "DB updated but event lost".
+
+### 7.8 Saga Pattern
+- Manages distributed transactions across multiple services.
+- Instead of one ACID transaction, uses a sequence of local transactions + **compensating actions**.
+- If one step fails, previous successful steps are rolled back using compensating transactions.
+
+**Example: Order Placement**
+```
+1. Reserve inventory   ✓ success
+2. Process payment     ✗ failed
+   → Compensate: release inventory
+   → Mark order as FAILED / notify user
+```
+- **Choreography:** services react to each other's events (no central coordinator).
+- **Orchestration:** a central orchestrator directs each step (easier to reason about for complex flows; e.g., Temporal, Step Functions).
+
+---
+
+## 8. Production Engineering
+
+Building a system is not enough. It must run reliably in production, handle real traffic, and be easy to operate and maintain.
+
+### 8.1 Logs
+- Help understand what happened in the system; used for debugging, auditing, monitoring.
+- Should contain: timestamp, level, service, message, traceId, relevant context.
+- Use **structured logs (JSON)** instead of plain text.
+
+```json
+{
+  "timestamp": "2026-09-24T10:30:00Z",
+  "level": "INFO",
+  "service": "order-service",
+  "traceId": "a1b2c3d4",
+  "message": "Order created successfully",
+  "userId": "12345"
+}
+```
+- Levels: `DEBUG`, `INFO`, `WARN`, `ERROR`. Keep production at `INFO`.
+- **Never log** passwords, tokens, card numbers, or sensitive PII.
+- Centralize: ELK/OpenSearch, Loki, Datadog, CloudWatch.
+
+### 8.2 Metrics
+- Numerical data about the health and performance of the system.
+- Monitor traffic, errors, latency, resources (CPU, memory); drive alerting and capacity planning.
+
+| Metric | Example |
+|---|---|
+| `request_count` | Total requests |
+| `request_latency` | P50, P95, P99 |
+| `error_rate` | 4xx, 5xx |
+| `cpu_usage`, `memory_usage` | Resource usage |
+
+- **Golden signals:** latency, traffic, errors, saturation (RED: Rate, Errors, Duration).
+- Track percentiles, not averages. Tools: Prometheus + Grafana, Datadog, CloudWatch.
+- Alert on symptoms users feel (error rate, latency SLOs), not every blip.
+
+### 8.3 Distributed Tracing
+- Tracks a request as it flows across multiple services; finds exactly where latency or failure occurred.
+- Each request has a unique **traceId**; each hop is a **span**.
+- Example: `Client (traceId a1b2c3) → Order Service (span 1, 50ms) → Payment Service (span 2, 120ms) → Notification Service (span 3, 80ms)`.
+- Tools: Jaeger, Zipkin, OpenTelemetry (standard for instrumentation).
+- Propagate trace context (`traceparent` header) on every outbound call and include traceId in logs.
+
+### 8.4 Graceful Degradation
+- When part of the system fails or is under heavy load, keep working with reduced functionality instead of failing completely.
+- **Examples:** show cached data if DB is down; disable non-critical features (recommendations); return a default response.
+- Flow: `User request → Main service → External service ✗ unavailable → Fallback response (cached/default data)`.
+- Combine with timeouts, circuit breakers, and feature flags.
+
+### 8.5 Traffic Spikes / Viral Traffic
+Sudden traffic increases from promotions, viral content, or external events. The system must handle them without crashing.
+
+**Techniques**
+- Auto-scaling (horizontal)
+- Load balancing
+- Caching (CDN, Redis)
+- Rate limiting
+- Queueing (Kafka, RabbitMQ) to absorb bursts
+- Graceful degradation
+- Load testing beforehand (k6, Locust, JMeter); pre-warm for known events
+
+### 8.6 Blue-Green Deployment
+- Two identical production environments: **Blue** (current) and **Green** (new).
+- New version is deployed to the inactive environment, verified, then the load balancer switches traffic from Blue to Green.
+- If any issue, switch back quickly (instant rollback).
+- Cost: double infrastructure during deploy; DB migrations must be backward-compatible.
+
+### 8.7 Rolling Deployment
+- New version is gradually rolled out to a few instances at a time.
+- Old and new versions run together during the transition → **must be backward compatible**.
+- Reduces risk compared to a full switch; rollout can be paused/stopped if issues appear.
+```
+Step 1: all instances v1
+Step 2: deploy v2 to a few instances
+Step 3: increase gradually
+Step 4: all instances v2
+```
+
+### 8.8 Related Deployment Practices
+- **Canary releases:** send a small % of traffic (1–5%) to the new version, watch metrics, then expand.
+- **Feature flags:** decouple deploy from release; kill switches for risky features.
+- **Database migrations:** expand → migrate → contract (never break the running version).
+- **Health checks:** liveness and readiness endpoints (`/healthz`, `/ready`).
+- **Graceful shutdown:** stop accepting new requests, finish in-flight ones, then exit.
+- **CI/CD:** automated tests, lint, security scans before every deploy.
+
+---
+
+## 9. Design Review Checklist
+
+Use before shipping any feature or service. Ask Claude Code to "review against the checklist".
+
+**API**
+- [ ] RESTful resource naming, correct methods, correct status codes
+- [ ] Input validation and consistent error format
+- [ ] Pagination on all list endpoints (cursor for large data)
+- [ ] Versioning strategy
+
+**Security**
+- [ ] Authentication on every non-public route; authorization checked per action/resource
+- [ ] Passwords hashed (bcrypt/argon2); secrets in env/secret manager, never in code
+- [ ] Rate limiting on public and auth endpoints
+- [ ] No sensitive data in logs, URLs, or JWT payloads
+
+**Data**
+- [ ] Indexes match query patterns (verified with `EXPLAIN`)
+- [ ] Unique constraints on business keys
+- [ ] Transactions around multi-step writes; correct isolation level
+- [ ] Concurrency handled (optimistic/pessimistic locking) where updates collide
+- [ ] Migrations backward-compatible
+
+**Performance**
+- [ ] Hot reads cached with TTL and an invalidation plan
+- [ ] No N+1 queries
+- [ ] Static assets on a CDN
+
+**Reliability**
+- [ ] Timeouts on every external call
+- [ ] Retries with exponential backoff + jitter, only for transient errors
+- [ ] Idempotency for retried writes and message consumers
+- [ ] Circuit breakers / fallbacks for critical dependencies
+- [ ] Async work via queue with dead-letter handling
+- [ ] Multi-service transactions use Saga / Outbox
+
+**Operations**
+- [ ] Structured JSON logs with traceId
+- [ ] Metrics (rate, errors, latency P95/P99) + alerts
+- [ ] Distributed tracing (OpenTelemetry)
+- [ ] Health checks and graceful shutdown
+- [ ] Safe deployment (rolling / blue-green / canary) with a rollback plan
+- [ ] Load-tested for expected peak
+
+---
+
+## 10. Quick Decision Guide
+
+| Question | Default choice | Switch when… |
+|---|---|---|
+| Database? | PostgreSQL | Access pattern clearly fits NoSQL (massive writes, key-value, documents) |
+| Architecture? | Modular monolith | Multiple teams, independent scaling/deploy needs |
+| Auth? | Sessions (web) / short-lived JWT + refresh (APIs, mobile) | Third-party login needed → OAuth 2.0 / OIDC |
+| Pagination? | Cursor-based | Small admin lists needing page numbers → offset |
+| Cache pattern? | Cache-aside + TTL | Strong consistency needed → write-through or no cache |
+| Service calls? | REST externally, gRPC internally if perf matters | Work can be async → messaging |
+| Concurrency control? | Optimistic locking | High contention → pessimistic locks |
+| Scaling DB reads? | Indexes → cache → read replicas | Still not enough → partitioning → sharding |
+| Scaling DB writes? | Batching, queues, partitioning | Still not enough → sharding / distributed DB |
+| Deployment? | Rolling | Need instant rollback → blue-green; risky change → canary |
+
+---
+
+## 11. Glossary
+
+- **ACID:** Atomicity, Consistency, Isolation, Durability.
+- **CAP theorem:** under a network partition, a distributed system must choose Consistency or Availability.
+- **Eventual consistency:** replicas converge over time; reads may be briefly stale.
+- **Idempotency:** repeating an operation yields the same result.
+- **P95/P99:** latency below which 95%/99% of requests fall.
+- **SLA / SLO / SLI:** agreement / objective / indicator for service reliability.
+- **Dead-letter queue (DLQ):** where messages go after repeated processing failures.
+- **Backpressure:** slowing producers when consumers can't keep up.
+- **Fencing token:** monotonically increasing number that prevents stale lock holders from writing.
+- **CDC (Change Data Capture):** streaming DB changes as events (e.g., Debezium).
